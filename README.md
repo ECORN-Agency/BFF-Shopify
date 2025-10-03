@@ -1,6 +1,7 @@
 # Техническая и функциональная спецификация
 ## Shopify Custom App - BFF для мобильного приложения LIME
 
+
 ## Содержание
 
 1. [Обзор проекта](#обзор-проекта)
@@ -12,12 +13,14 @@
    - [Возвраты из Rich Returns](#возвраты-из-rich-returns)
 4. [API Endpoints с логикой работы](#api-endpoints-с-логикой-работы)
    - [Аутентификация и регистрация](#аутентификация-и-регистрация)
+   - [Восстановление пароля](#восстановление-пароля)
    - [Гостевой токен](#гостевой-токен)
    - [Профиль клиента](#профиль-клиента)
    - [Каталог товаров через Storefront API](#каталог-товаров-через-storefront-api)
    - [Поиск через Storefront API](#поиск-через-storefront-api)
    - [Корзина (прямое взаимодействие с Shopify)](#корзина-прямое-взаимодействие-с-shopify)
    - [Wishlist интеграция с Swish](#wishlist-интеграция-с-swish)
+   - [Страницы контента](#страницы-контента)
 5. [Интеграции с третьими сторонами](#интеграции-с-третьими-сторонами)
    - [Rich Returns интеграция](#rich-returns-интеграция)
 6. [Webhook обработчики](#webhook-обработчики)
@@ -225,6 +228,68 @@ const ReturnSchema = new mongoose.Schema({
 });
 ```
 
+### Кэшированные Wishlist
+
+```javascript
+const WishlistCacheSchema = new mongoose.Schema({
+  shopId: { type: String, index: true },
+  customerId: { type: String, index: true },
+  // Кэшированные данные из Swish
+  wishlistItems: [{
+    productId: String,
+    variantId: String,
+    handle: String,
+    title: String,
+    price: String,
+    image: String,
+    addedAt: Date
+  }],
+  // ID товаров для быстрого поиска
+  productIds: [String],
+  // Метаданные кэша
+  lastSyncedAt: Date,
+  expiresAt: { type: Date, index: { expireAfterSeconds: 0 } },
+  createdAt: Date
+});
+```
+
+**Логика и обоснование WishlistCacheSchema:**
+- **Кэширование wishlist данных** - для быстрой проверки статуса товаров без обращения к Swish API
+- **productIds массив** - быстрая проверка наличия товара в wishlist
+- **TTL индекс** - автоматическое обновление кэша через 1 час
+
+### Кэшированные страницы
+
+```javascript
+const PageCacheSchema = new mongoose.Schema({
+  shopId: { type: String, index: true },
+  handle: { type: String, index: true },
+  market: String, // 'AE', 'SA', etc.
+  language: String, // 'en', 'ar'
+  // Данные страницы из Shopify
+  pageData: {
+    id: String,
+    title: String,
+    content: String, // HTML контент
+    summary: String,
+    seo: {
+      title: String,
+      description: String
+    }
+  },
+  // Метаданные кэша
+  lastSyncedAt: Date,
+  expiresAt: { type: Date, index: { expireAfterSeconds: 0 } },
+  createdAt: Date
+});
+```
+
+**Логика и обоснование PageCacheSchema:**
+- **Кэширование страниц** - страницы редко изменяются, кэш снижает нагрузку на Storefront API
+- **Региональное кэширование** - разные версии страниц для разных регионов
+- **TTL индекс** - автоматическое обновление кэша через 4 часа
+
+
 ## API Endpoints с логикой работы
 
 ### Аутентификация и регистрация
@@ -290,6 +355,48 @@ const ReturnSchema = new mongoose.Schema({
 
 **Логика работы:** BFF авторизует через Storefront API, обновляет существующую гостевую сессию с customerId, привязывает корзину и wishlist к клиенту, возвращает JWT токен.
 
+### Восстановление пароля
+
+#### POST /api/auth/password-reset-request
+
+Запрос от мобильного приложения:
+```json
+{
+  "email": "customer@example.com"
+}
+```
+
+Ответ BFF приложения:
+```json
+{
+  "success": true,
+  "message": "Инструкции по восстановлению пароля отправлены на email"
+}
+```
+
+**Логика работы:** BFF использует Shopify Storefront API customerRecover mutation для отправки email с инструкциями по восстановлению пароля.
+
+#### POST /api/auth/password-reset
+
+Запрос от мобильного приложения:
+```json
+{
+  "resetToken": "reset_token_from_email",
+  "newPassword": "newpassword123"
+}
+```
+
+Ответ BFF приложения:
+```json
+{
+  "success": true,
+  "message": "Пароль успешно изменен"
+}
+```
+
+**Логика работы:** BFF использует Shopify Storefront API customerReset mutation с токеном из email для установки нового пароля.
+
+
 ### Гостевой токен
 
 #### POST /api/auth/guest
@@ -349,6 +456,40 @@ Headers: Authorization: Bearer JWT_TOKEN
 
 **Логика работы:** BFF запрашивает детальную информацию товара напрямую из Storefront API, для авторизованных пользователей проверяет статус в wishlist через Swish API.
 
+#### GET /api/products/:handle/recommendations
+
+Запрос мобильного приложения:
+```
+GET /api/products/premium-dress/recommendations?limit=4
+Headers: Authorization: Bearer JWT_TOKEN (опционально)
+```
+
+Ответ BFF приложения:
+```json
+{
+  "data": {
+    "recommendations": [
+      {
+        "id": 555777888,
+        "title": "Matching Accessories",
+        "handle": "matching-accessories",
+        "price": {
+          "amount": "89.00",
+          "currency": "AED"
+        },
+        "image": {
+          "url": "https://cdn.shopify.com/...",
+          "alt": "Matching Accessories"
+        },
+        "available": true
+      }
+    ]
+  }
+}
+```
+
+**Логика работы:** BFF получает рекомендации для конкретного товара через Shopify Storefront API productRecommendations query, применяет региональные цены и фильтрацию по доступности.
+
 ### Поиск через Storefront API
 
 #### GET /api/search
@@ -389,6 +530,37 @@ Headers: Authorization: Bearer JWT_TOKEN
 
 **Привязка после авторизации:** При логине BFF автоматически переносит товары из guestWishlistItems в Swish wishlist клиента.
 
+### Страницы контента
+
+#### GET /api/pages/:handle
+
+Запрос мобильного приложения:
+```
+GET /api/pages/about-us?market=AE&language=en
+```
+
+Ответ BFF приложения:
+```json
+{
+  "data": {
+    "page": {
+      "id": "gid://shopify/Page/123456789",
+      "title": "About LIME",
+      "content": "<p>Premium fashion retailer...</p>",
+      "summary": "Learn about LIME fashion",
+      "seo": {
+        "title": "About LIME - Premium Fashion",
+        "description": "Discover LIME's story and commitment to fashion excellence"
+      }
+    },
+    "cached": true,
+    "lastUpdated": "2025-10-03T08:00:00Z"
+  }
+}
+```
+
+**Логика работы:** BFF проверяет кэш страницы в MongoDB по handle, market и language. При отсутствии или устаревании кэша запрашивает страницу из Shopify Storefront API, сохраняет в кэш с TTL 4 часа и возвращает клиенту.
+
 ## Интеграции с третьими сторонами
 
 ### Rich Returns интеграция
@@ -410,8 +582,6 @@ Headers: Authorization: Bearer JWT_TOKEN
 
 ## Зона ответственности BFF
 
-**BFF сервис отвечает за:**
-
 1. **Реализация авторизированного доступа** к Admin, Storefront и другим API
 2. **Предоставление единого фасада** для взаимодействия с Shopify и сторонними сервисами
 3. **Управление пользовательскими сессиями** и их унификация
@@ -420,7 +590,8 @@ Headers: Authorization: Bearer JWT_TOKEN
 6. **Авторизация пользователя** и привязка к гостевой сессии после успешной авторизации
 7. **Привязка возвратов** из стороннего приложения к заказам пользователя
 8. **Кэширование содержимого корзины** (опционально, нужно для оптимизации)
-   
+9. **Кэширование wishlist и страниц** для оптимизации производительности
+10. **Восстановление паролей** через Shopify API
 
 **BFF в первой версии НЕ отвечает за:**
 - Кэширование товаров и коллекций (получение напрямую из Storefront API)
@@ -428,13 +599,14 @@ Headers: Authorization: Bearer JWT_TOKEN
 - Обогащенное содержимое меню (получение через Storefront API)
 - Хранение состояния корзины отдельно от Shopify
 - Предоставление контента, которые не относится к продуктовым данным
-  
 
 ## Полный список API Endpoints
 
 ### Аутентификация
 - `POST /api/auth/register` - Регистрация нового пользователя
 - `POST /api/auth/login` - Авторизация пользователя
+- `POST /api/auth/password-reset-request` - Запрос восстановления пароля
+- `POST /api/auth/password-reset` - Восстановление пароля
 - `POST /api/auth/guest` - Получение гостевого токена
 - `POST /api/auth/logout` - Выход из системы
 
@@ -453,6 +625,7 @@ Headers: Authorization: Bearer JWT_TOKEN
 - `GET /api/collections` - Список коллекций
 - `GET /api/collections/:handle/products` - Товары коллекции с фильтрацией по размеру
 - `GET /api/products/:handle` - Детальная страница товара с рекомендованными товарами
+- `GET /api/products/:handle/recommendations` - Рекомендации для товара
 
 ### Поиск товаров
 - `GET /api/search` - Полнотекстовый поиск товаров
@@ -473,6 +646,7 @@ Headers: Authorization: Bearer JWT_TOKEN
 
 ### Контент
 - `GET /api/menu/navigation` - Получение меню
+- `GET /api/pages/:handle` - Получение страницы контента
 
 ### Политики возврата
 - `GET /api/returns/policies` - Получение политик возврата
@@ -486,6 +660,7 @@ Headers: Authorization: Bearer JWT_TOKEN
 | **Авторизация/Регистрация/Управление сессиями** | |
 | - Управление сессиями пользователей (сущность сессии, время жизни, выпуск и валидация токенов, настройки региона) | 24 |
 | - Логин, Регистрация, привязка гостевой сессии после авторизации, привязка корзины и вишлиста, логаут | 20 |
+| - Password reset request и password reset ендпоинты | 6 |
 | **Профиль клиента** | |
 | - Получение данных профиля, редактирование данных профиля | 10 |
 | - Добавление, редактирование, удаление адресов, список адресов | 10 |
@@ -494,18 +669,21 @@ Headers: Authorization: Bearer JWT_TOKEN
 | **Каталог товаров** | |
 | - Получение списка коллекций | 5 |
 | - Получение списка продуктов в коллекции, фильтрация по размеру, постраничная навигация | 12 |
-| - Получение деталей продукта, получение рекомендованных продуктов | 8 |
+| - Получение деталей продукта | 8 |
+| - GET /products/:handle/recommendations | 8 |
 | - Получение вишлиста, добавление/удаление из вишлиста, привязка к гостевой сессии, авторизация API приложения | 18 |
+| - Кэширование вишлистов и возврат ID как они просили | 10 |
 | **Поиск** | |
 | - Получение автоподсказок по введенному запросу | 6 |
 | - Получение результатов поиска по запросу, постраничная навигация | 12 |
 | **Корзина** | |
 | - Создание корзины, привязка к текущей сессии, получение корзины, добавление атрибутов | 18 |
 | - Добавление, удаление продукта, изменение количества, создание чекаута | 14 |
-| **Обработка заказов** | |
-| - Добавление тегов в созданные заказы, хранение истории заказов и возвратов в БД | 10 |
 | **Контент** | |
 | - Получение меню | 4 |
+| - GET /pages/:handle | 8 |
+| **Обработка заказов** | |
+| - Добавление тегов в созданные заказы, хранение истории заказов и возвратов в БД | 10 |
 | **Остальное** | |
 | - Развёртывание и настройка дев окружения | 6 |
 | - Тестирование и исправление проблем | 30 |
@@ -514,7 +692,7 @@ Headers: Authorization: Bearer JWT_TOKEN
 | - Подготовка и развёртывание прод окружения (AWS), настройка мониторинга | 30 |
 | - Настройка автоматического развёртывания | 14 |
 | - Описание и генерация API документации | 20 |
-| **Общее время** | **339 часов** |
+| **Общее время** | **363 часа** |
 
 ## Исключения из MVP
 
